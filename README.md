@@ -2,7 +2,7 @@
 
 A mobile and web app for fragrance collectors: browse a perfume catalog, keep a personal vault of the bottles you own and (planned) work out how much liquid is left in an opaque bottle from its weight.
 
-Built with **Flutter** and **Firebase** (Authentication + Cloud Firestore). Runs on **Android** and **Web**. iOS is not configured.
+Built with **Flutter** and **Firebase** (Authentication, Cloud Firestore, Cloud Functions, App Check and Hosting). Runs on **Android** and **Web**. iOS is not configured.
 
 **Live demo:** [perfumedex.com](https://perfumedex.com)
 
@@ -10,6 +10,7 @@ Built with **Flutter** and **Firebase** (Authentication + Cloud Firestore). Runs
 
 - Onboarding (3 swipeable pages, shown only on first launch) and a splash screen.
 - Email/password sign-up and sign-in, with specific messages for the common errors (email already in use, weak password, invalid credentials).
+- Google sign-in: Authentication with Google in Android and Web
 - Catalog of perfumes as a grid, in alphabetical order and in pages of 48 with a **Cargar más** (load more) button, genre and season filters, plus in-memory search by name, brand or note.
 - Perfume detail: olfactory pyramid, seasons and retail offers. The URL carries the perfume id, so it survives a page reload on web.
 - Personal vault: add perfumes from the detail screen; the list updates in real time. Free tier limited to 5 perfumes. A **Últimos 30 días** (last 30 days) chip shows only the bottles added in the last 30 days.
@@ -17,9 +18,8 @@ Built with **Flutter** and **Firebase** (Authentication + Cloud Firestore). Runs
 - Nearby perfume shops (at the end of every perfume detail): on tap, asks for location permission, finds the 5 closest of ~1,100 shops in Spain (OpenStreetMap data), shows them on a map and in a list sorted by distance, and opens a card with address, opening hours, phone and directions. If the device cannot give its position, it offers the area of the last search.
 - Profile: view and edit your display name, see and delete the saved search area, sign out.
 - Route guard: private screens redirect to login when there is no session.
-- Google sign-in: Authentication with Google in Android and Web
 
-Planned (see [ROADMAP.md](ROADMAP.md)): remaining-volume calculator from scale tare data, retail price comparison, edit/delete of vault items, an AI-assisted advisor.
+Planned (see [ROADMAP.md](ROADMAP.md)): remaining-volume calculator from scale tare data, retail price comparison, an AI-assisted advisor.
 
 ## Architecture
 
@@ -51,6 +51,8 @@ lib/
                        distance_format.dart
                        (pure functions, no Flutter or Firebase)
 functions/             Cloud Function nearbyStores (Python)
+                       Cloud Function billing_guard.py
+                       Cloud Function rate_limit.py
 tools/seeder/          Node script that bulk-loads the catalog into Firestore
 tools/stores/          Node scripts that geocode and load the shops
 ```
@@ -177,6 +179,41 @@ Each bottle in the vault can carry a photo taken by its owner. It is added from 
 - **Storage.** The JPEG is saved as Base64 text in the `userBottlePhoto` field of the vault document, under 300,000 characters (about 220 KB of JPEG, usually much less), a limit the security rules enforce too. Base64 makes it a third larger, but the photo lives in the same document as the bottle: it syncs across devices with the rest of the data and needs no extra service. The model decodes it once per snapshot, not on every rebuild. The trade-off is that every update of the vault stream downloads the photos again; if vaults become public or bottles get several photos, the photo will move to Cloud Storage, and only `VaultService` and the model would change.
 - **Lost photos.** Android may close the app while the camera is open. Before opening it, the app saves the bottle id with `shared_preferences`; the next time the vault opens, `retrieveLostData()` returns the photo and the app finishes compressing and saving it.
 
+## Google sign-in
+
+- **Android** uses `google_sign_in` 7: the native account picker returns an ID token, which is exchanged for a Firebase credential (`GoogleAuthProvider.credential`). Google only accepts it if the Android app registered in Firebase has the fingerprints of the key that signed the build:
+  - Get the SHA-1 and SHA-256 with `cd android && ./gradlew signingReport` (variant `debug`), or with `keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android`.
+  - Add both in Firebase console > Project settings > Your apps > Android app (`com.perfumedex.app`) > Add fingerprint, then download `google-services.json` again.
+  - With the fingerprint, Firebase creates the **Android OAuth client** (package name + SHA-1) in Google Cloud. `google-services.json` also carries the **web OAuth client ID**, which `google_sign_in` uses as its server client ID so the ID token is issued for Firebase.
+  - Every machine that builds the app needs the same debug keystore or its own fingerprint registered. A release build signed with another key (Google Play) needs its own fingerprints too.
+- **Web** uses Firebase Auth's `signInWithPopup` with `GoogleAuthProvider`, which works with the web OAuth client that Firebase created. Every domain that serves the app must be in Authentication > Settings > Authorized domains: `localhost`, `parfumdex.web.app` and `perfumedex.com`.
+- **Cancel and errors.** Closing the picker (Android) or the popup (web) returns to the login screen with no error. A blocked popup and other failures show a message.
+- **Account and profile.** The first Google sign-in creates the profile in `users/{uid}`; later sign-ins read the existing one.
+- The fingerprints and client IDs are not secrets, but the files that carry them (`google-services.json`, `firebase_options.dart`) stay out of Git (see [Configuration and credentials](#configuration-and-credentials)).
+
+## Web deployment
+
+The web app is live at **[perfumedex.com](https://perfumedex.com)**, served by Firebase Hosting with a custom domain (`www.perfumedex.com` redirects to it, and `parfumdex.web.app` serves the same build).
+
+```bash
+flutter build web --release
+firebase deploy --only hosting
+```
+
+`firebase.json` publishes `build/web` and rewrites every path to `/index.html`, so a go_router URL such as `/explore/detail/<id>` survives a page reload. It also sends security headers (HSTS, `X-Frame-Options: DENY`, `nosniff`, and a `Permissions-Policy` that only allows location and camera for the app itself).
+
+A new domain also has to be added in three other places, or sign-in and the shop search fail only on that domain: Authentication > Authorized domains, the reCAPTCHA Enterprise key used by App Check, and the website restrictions of the web API key in Google Cloud.
+
+## Cost safeguards
+
+The backend is pay-as-you-go, so a bug or abuse could turn into a bill. Several independent layers keep that from happening:
+
+- **Automatic shut-off.** A Cloud Billing budget publishes to Pub/Sub when it is exceeded, and the `stopBilling` function (`functions/billing_guard.py`) detaches billing from the project. The app stops instead of running up costs.
+- **Usage alerts.** Cloud Monitoring alerts on Firestore reads and writes warn early and, past a higher threshold, trigger the same shut-off.
+- **Spend caps** per service in the Firebase console.
+- **Only the real app can call the backend.** App Check (Play Integrity on Android, reCAPTCHA Enterprise on web) is enforced by the `nearbyStores` function, which also requires a signed-in user and rate-limits each one.
+- **No bulk downloads.** The security rules reject list queries without a `limit` or above the maximum, and the `stores` collection cannot be read from the client at all.
+
 ## Getting started
 
 ### Prerequisites
@@ -207,7 +244,7 @@ Choose one:
 
 - **Use the maintainer's project:** ask the maintainer for the two files and place them at the paths above.
 - **Use your own Firebase project:**
-  1. Create a Firebase project and enable **Authentication > Email/Password** and **Firestore Database**.
+  1. Create a Firebase project and enable **Authentication > Email/Password/Google** and **Firestore Database**.
   2. Install the FlutterFire CLI and run `flutterfire configure --platforms=android,web`.
      When asked for the Android package name, use `com.perfumedex.app`, or change `applicationId` in `android/app/build.gradle.kts` to match the one you register.
   3. Publish the rules in `lib/firestore.rules` and the composite indexes in `firestore.indexes.json` with `firebase deploy --only firestore`. The indexes take a few minutes to build; until then the catalog filters show an error.
