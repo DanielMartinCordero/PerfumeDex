@@ -225,7 +225,7 @@ The backend is pay-as-you-go, so a bug or abuse could turn into a bill. Several 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/DanielMartinCordero/perfume_dex.git
+git clone https://github.com/DanielMartinCordero/PerfumeDex.git
 cd perfume_dex
 flutter pub get
 ```
