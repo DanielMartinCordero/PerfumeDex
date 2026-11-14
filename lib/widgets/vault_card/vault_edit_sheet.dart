@@ -1,3 +1,5 @@
+import 'dart:async' show TimeoutException;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../models/vault_item.dart';
@@ -151,7 +153,9 @@ class _VaultEditSheetState extends State<VaultEditSheet> {
         remainingMl: remaining,
         purchasePrice: _parseNumber(_priceController.text),
         rating: _rating,
-      );
+      // Sin red, Firestore guarda el cambio en local pero el Future no
+      // termina hasta que el servidor lo confirma: se deja de esperar a los 15 s
+      ).timeout(const Duration(seconds: 15));
       snackBar = (hasChanged || _photoChanged)
           ? const SnackBar(
               content: Text('Cambios guardados'),
@@ -161,6 +165,14 @@ class _VaultEditSheetState extends State<VaultEditSheet> {
               content: const Text('No has cambiado ningún dato'),
               backgroundColor: Colors.orange.shade800,
             );
+    } on TimeoutException {
+      // El cambio no se ha perdido: ya está en local y se subirá solo
+      snackBar = SnackBar(
+        content: const Text(
+          'Tiempo agotado: sin conexión. El cambio se guardará al volver la red',
+        ),
+        backgroundColor: Colors.orange.shade800,
+      );
     } catch (e) {
       snackBar = const SnackBar(
         content: Text('Ha ocurrido un error'),
